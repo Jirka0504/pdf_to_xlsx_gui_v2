@@ -263,10 +263,10 @@ def parse_omnia(lines: list[str]):
         re.VERBOSE,
     )
 
-    cont_row_re = re.compile(
+    split_row_re = re.compile(
         r"""
         ^
-        (?P<name>.+?)\s+
+        (?P<name>.+?)\s*-\s+
         (?P<tail_code>[A-Z0-9\-.]+)\s+
         (?P<qty>\d+)\s+PZ\s+
         (?P<price>\d+(?:\.\d{2}))\s+€\s+
@@ -307,6 +307,7 @@ def parse_omnia(lines: list[str]):
 
     for raw_line in lines:
         line = normalize_text(raw_line).replace("￾", "")
+
         if any(line.startswith(prefix) for prefix in skip_prefixes):
             continue
 
@@ -329,24 +330,21 @@ def parse_omnia(lines: list[str]):
             pending_prefix = None
             continue
 
-        # 2) řádek obsahuje jen první část kódu zakončenou pomlčkou
-        # např. VEN-
-        if re.fullmatch(r"[A-Z0-9]+-$", line):
-            pending_prefix = line
+        # 2) případ slepeného prefixu + pokračování kódu, např. VEN149198350
+        # chceme z toho udělat prefix VEN-
+        m_prefix = re.fullmatch(r"([A-Z]{2,10})(\d{5,})", line)
+        if m_prefix:
+            pending_prefix = m_prefix.group(1).strip() + "-"
             continue
 
-        # 3) řádek typu VEN149198350 nebo VEN 149198350 po čištění
-        # rozdělíme prefix zakončený pomlčkou implicitně
-        if re.fullmatch(r"[A-Z]+[0-9][A-Z0-9\-.]*", line) and " PZ " not in line:
-            # speciálně pro případy, kdy OCR slepí prefix a pokračování
-            m_code = re.match(r"^([A-Z]+)([0-9].+)$", line)
-            if m_code:
-                pending_prefix = m_code.group(1) + "-"
-                line = m_code.group(2)
+        # 3) případ samostatného prefixu zakončeného pomlčkou, např. VEN-
+        if re.fullmatch(r"[A-Z0-9]+-$", line):
+            pending_prefix = line.strip()
+            continue
 
-        # 4) pokud čekáme na pokračování kódu, spojíme ho s dalším řádkem
+        # 4) pokud čekáme na pokračování, vezmeme další řádek
         if pending_prefix:
-            m2 = cont_row_re.match(line)
+            m2 = split_row_re.match(line)
             if m2:
                 full_code = pending_prefix + m2.group("tail_code").strip()
                 items.append({
@@ -362,7 +360,7 @@ def parse_omnia(lines: list[str]):
                 pending_prefix = None
                 continue
 
-            # kdyby druhý řádek nezačínal názvem, ale přímo číslem
+            # fallback: kdyby další řádek nezačínal názvem s pomlčkou
             m3 = re.match(
                 r"""
                 ^
@@ -391,8 +389,7 @@ def parse_omnia(lines: list[str]):
                 pending_prefix = None
                 continue
 
-        # 5) neparsované řádky neber jako chybu, jen ignoruj
-        # kvůli souhrnům nebo rozbitým OCR fragmentům
+        # neparsované řádky jen ignorujeme
 
     return items, warnings
 
