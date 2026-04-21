@@ -267,6 +267,7 @@ def parse_omnia(lines: list[str]):
         r"""
         ^
         (?P<name>.+?)\s+
+        (?P<tail_code>[A-Z0-9\-.]+)\s+
         (?P<qty>\d+)\s+PZ\s+
         (?P<price>\d+(?:\.\d{2}))\s+€\s+
         (?P<total>\d+(?:\.\d{2}))\s+€
@@ -302,31 +303,17 @@ def parse_omnia(lines: list[str]):
         "Spese di Trasporto UE Vendita - Shipping Fees",
     )
 
-    pending_code_fragment = None
+    pending_prefix = None
 
-    for line in lines:
+    for raw_line in lines:
+        line = normalize_text(raw_line).replace("￾", "")
         if any(line.startswith(prefix) for prefix in skip_prefixes):
             continue
 
         if line.startswith("KTS - AME") or line.startswith("Karla Čapka") or line.startswith("500 02"):
             continue
 
-        if pending_code_fragment:
-            m2 = cont_row_re.match(line)
-            if m2:
-                items.append({
-                    "Interní kód zboží": pending_code_fragment,
-                    "Název": m2.group("name").strip(),
-                    "Množství": int(m2.group("qty")),
-                    "Cena celkem": en_number_to_float(m2.group("total")),
-                    "Zkrácená poznámka": "",
-                    "Kód kombinované nomenklatury": "",
-                    "Země původu": "",
-                    "Hmotnost": "",
-                })
-                pending_code_fragment = None
-                continue
-
+        # 1) běžný kompletní řádek
         m = full_row_re.match(line)
         if m:
             items.append({
@@ -339,14 +326,75 @@ def parse_omnia(lines: list[str]):
                 "Země původu": "",
                 "Hmotnost": "",
             })
+            pending_prefix = None
             continue
 
-        if looks_like_split_code_only(line):
-            pending_code_fragment = line
+        # 2) řádek obsahuje jen první část kódu zakončenou pomlčkou
+        # např. VEN-
+        if re.fullmatch(r"[A-Z0-9]+-$", line):
+            pending_prefix = line
             continue
+
+        # 3) řádek typu VEN149198350 nebo VEN 149198350 po čištění
+        # rozdělíme prefix zakončený pomlčkou implicitně
+        if re.fullmatch(r"[A-Z]+[0-9][A-Z0-9\-.]*", line) and " PZ " not in line:
+            # speciálně pro případy, kdy OCR slepí prefix a pokračování
+            m_code = re.match(r"^([A-Z]+)([0-9].+)$", line)
+            if m_code:
+                pending_prefix = m_code.group(1) + "-"
+                line = m_code.group(2)
+
+        # 4) pokud čekáme na pokračování kódu, spojíme ho s dalším řádkem
+        if pending_prefix:
+            m2 = cont_row_re.match(line)
+            if m2:
+                full_code = pending_prefix + m2.group("tail_code").strip()
+                items.append({
+                    "Interní kód zboží": full_code,
+                    "Název": m2.group("name").strip(),
+                    "Množství": int(m2.group("qty")),
+                    "Cena celkem": en_number_to_float(m2.group("total")),
+                    "Zkrácená poznámka": "",
+                    "Kód kombinované nomenklatury": "",
+                    "Země původu": "",
+                    "Hmotnost": "",
+                })
+                pending_prefix = None
+                continue
+
+            # kdyby druhý řádek nezačínal názvem, ale přímo číslem
+            m3 = re.match(
+                r"""
+                ^
+                (?P<tail_code>[A-Z0-9\-.]+)\s+
+                (?P<name>.+?)\s+
+                (?P<qty>\d+)\s+PZ\s+
+                (?P<price>\d+(?:\.\d{2}))\s+€\s+
+                (?P<total>\d+(?:\.\d{2}))\s+€
+                $
+                """,
+                line,
+                re.VERBOSE,
+            )
+            if m3:
+                full_code = pending_prefix + m3.group("tail_code").strip()
+                items.append({
+                    "Interní kód zboží": full_code,
+                    "Název": m3.group("name").strip(),
+                    "Množství": int(m3.group("qty")),
+                    "Cena celkem": en_number_to_float(m3.group("total")),
+                    "Zkrácená poznámka": "",
+                    "Kód kombinované nomenklatury": "",
+                    "Země původu": "",
+                    "Hmotnost": "",
+                })
+                pending_prefix = None
+                continue
+
+        # 5) neparsované řádky neber jako chybu, jen ignoruj
+        # kvůli souhrnům nebo rozbitým OCR fragmentům
 
     return items, warnings
-
 
 # =========================
 # SAVE XLSX
