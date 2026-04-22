@@ -263,21 +263,6 @@ def parse_omnia(lines: list[str]):
         re.VERBOSE,
     )
 
-    # pokračovací řádek:
-    # LOWER COFFEE MACHINE GEAR SUPPORT - 149198350 2 PZ 0.81 € 1.62 €
-    cont_row_re = re.compile(
-        r"""
-        ^
-        (?P<name>.+?)\s*-\s*
-        (?P<tail_code>[A-Z0-9\-.]+)\s+
-        (?P<qty>\d+)\s+PZ\s+
-        (?P<price>\d+(?:\.\d{2}))\s+€\s+
-        (?P<total>\d+(?:\.\d{2}))\s+€
-        $
-        """,
-        re.VERBOSE,
-    )
-
     skip_prefixes = (
         "Consegnare a:",
         "Spettabile:",
@@ -305,24 +290,72 @@ def parse_omnia(lines: list[str]):
         "Spese di Trasporto UE Vendita - Shipping Fees",
     )
 
-    pending_prefix = None
+    def try_parse_split(prefix_code: str, next_line: str):
+        """
+        Prefix z prvního řádku:
+            VEN-
+        nebo OCR slepené:
+            VEN149198350  -> prefix VEN-
 
-    for raw_line in lines:
-        line = normalize_text(raw_line)
+        Druhý řádek:
+            LOWER COFFEE MACHINE GEAR SUPPORT - 149198350 2 PZ 0.81 € 1.62 €
+        """
+        line = normalize_text(next_line).replace("￾", "").strip()
 
-        # OCR šum
-        line = line.replace("￾", "").strip()
+        m = re.match(
+            r"""
+            ^
+            (?P<name>.+?)           # název zboží
+            \s*-\s*
+            (?P<tail>\d{5,})        # pokračování kódu
+            \s+
+            (?P<qty>\d+)
+            \s+PZ\s+
+            (?P<price>\d+(?:\.\d{2}))
+            \s+€\s+
+            (?P<total>\d+(?:\.\d{2}))
+            \s+€
+            $
+            """,
+            line,
+            re.VERBOSE,
+        )
+        if not m:
+            return None
 
+        tail = m.group("tail").strip()
+        full_code = prefix_code + tail
+        name = m.group("name").strip()
+        qty = int(m.group("qty"))
+        total = en_number_to_float(m.group("total"))
+
+        return {
+            "Interní kód zboží": full_code,
+            "Název": name,
+            "Množství": qty,
+            "Cena celkem": total,
+            "Zkrácená poznámka": "",
+            "Kód kombinované nomenklatury": "",
+            "Země původu": "",
+            "Hmotnost": "",
+        }
+
+    cleaned_lines = []
+    for raw in lines:
+        line = normalize_text(raw).replace("￾", "").strip()
         if not line:
             continue
-
         if any(line.startswith(prefix) for prefix in skip_prefixes):
             continue
-
         if line.startswith("KTS - AME") or line.startswith("Karla Čapka") or line.startswith("500 02"):
             continue
+        cleaned_lines.append(line)
 
-        # 1) běžný kompletní řádek
+    i = 0
+    while i < len(cleaned_lines):
+        line = cleaned_lines[i]
+
+        # 1) normální kompletní řádek
         m = full_row_re.match(line)
         if m:
             items.append({
@@ -335,43 +368,43 @@ def parse_omnia(lines: list[str]):
                 "Země původu": "",
                 "Hmotnost": "",
             })
-            pending_prefix = None
+            i += 1
             continue
 
-        # 2) pokud je na řádku jen začátek kódu zakončený pomlčkou, např. VEN-
+        # 2) případ prefixu zakončeného pomlčkou, např. VEN-
         if re.fullmatch(r"[A-Z0-9]+-$", line):
-            pending_prefix = line.strip()
-            continue
+            prefix_code = line
+            if i + 1 < len(cleaned_lines):
+                parsed = try_parse_split(prefix_code, cleaned_lines[i + 1])
+                if parsed:
+                    items.append(parsed)
+                    i += 2
+                    continue
 
-        # 3) pokud OCR slepí prefix a pokračování do jednoho řádku, např. VEN149198350
-        # chceme z toho vzít prefix VEN-
+        # 3) OCR slepený případ: VEN149198350
+        # z toho chceme udělat prefix VEN-
         m_joined = re.fullmatch(r"(?P<prefix>[A-Z]{2,10})(?P<tail>\d{5,})", line)
         if m_joined:
-            pending_prefix = m_joined.group("prefix") + "-"
-            continue
+            prefix_code = m_joined.group("prefix") + "-"
+            if i + 1 < len(cleaned_lines):
+                parsed = try_parse_split(prefix_code, cleaned_lines[i + 1])
+                if parsed:
+                    items.append(parsed)
+                    i += 2
+                    continue
 
-        # 4) pokud čekáme na pokračování kódu, další řádek musí dodat konec kódu
-        if pending_prefix:
-            m2 = cont_row_re.match(line)
-            if m2:
-                full_code = pending_prefix + m2.group("tail_code").strip()
-
-                items.append({
-                    "Interní kód zboží": full_code,
-                    "Název": m2.group("name").strip(),
-                    "Množství": int(m2.group("qty")),
-                    "Cena celkem": en_number_to_float(m2.group("total")),
-                    "Zkrácená poznámka": "",
-                    "Kód kombinované nomenklatury": "",
-                    "Země původu": "",
-                    "Hmotnost": "",
-                })
-                pending_prefix = None
+        # 4) fallback: když by první řádek byl už přesně VEN149198350 a druhý řádek nešel,
+        # zkusíme prefix určit jen podle písmen na začátku
+        m_prefix_only = re.match(r"^([A-Z]{2,10})", line)
+        if m_prefix_only and i + 1 < len(cleaned_lines):
+            prefix_code = m_prefix_only.group(1) + "-"
+            parsed = try_parse_split(prefix_code, cleaned_lines[i + 1])
+            if parsed:
+                items.append(parsed)
+                i += 2
                 continue
 
-            # fallback: kdyby se další řádek nepodařilo naparsovat,
-            # prefix necháme ještě jeden cyklus žít
-            continue
+        i += 1
 
     return items, warnings
 # =========================
