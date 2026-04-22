@@ -410,9 +410,10 @@ def parse_omnia(lines: list[str]):
         i += 1
 
     return items, warnings
+    
 
 # =========================
-# OMNIA PARSER
+# CLASSIC PARSER
 # =========================
 
 def parse_classic(lines: list[str]):
@@ -420,78 +421,41 @@ def parse_classic(lines: list[str]):
     warnings = []
 
     cleaned_lines = []
-    skip_prefixes = (
-        "KTS - AME s.r.o.",
-        "Karla Capka 60/13",
-        "CZ 50002 Hradec Kralove",
-        "Tschechische Republik",
-        "Invoice",
-        "Invoice No.",
-        "Date = delivery date",
-        "Page",
-        "Account No.",
-        "Classic Service Parts GmbH",
-        "Rodensteiner Str.",
-        "64385 Reichelsheim/Germany",
-        "Tel.",
-        "Fax.",
-        "E-mail:",
-        "EORI:",
-        "www.classic-serviceparts.com",
-        "Managing Director:",
-        "Sparkasse Odenwaldkreis",
-        "CZ42194407VAT-ID-Nr.",
-        "VAT-ID-Nr.",
-        "Lieferschein:",
-        "Ihre Bestellangaben:",
-        "DPD",
-        "Tracking :",
-        "CIP Hradec Kralove",
-        "Goods Value",
-        "VAT %",
-        "VAT",
-        "Total Amount",
-        "payment within 30 days after invoice date, net !",
-        ">>>> tax free intracommunity delivery <<<<",
-        "EUR",
-        "grossweight :",
-    )
+
+    skip_words = [
+        "invoice",
+        "classic service parts",
+        "karla capka",
+        "tschechische",
+        "tracking",
+        "dpd",
+        "vat",
+        "goods value",
+        "total amount",
+        "payment within",
+        "grossweight",
+        "eur",
+    ]
 
     for raw in lines:
         line = normalize_text(raw)
         if not line:
             continue
 
-        if any(line.startswith(prefix) for prefix in skip_prefixes):
+        low = line.lower()
+
+        if any(word in low for word in skip_words):
             continue
 
-        # čistě technické / hlavičkové řádky
-        if line in ("==============================", "= 1 carton"):
-            continue
-
-        # řádky s číslem faktury / stránkou / účtem
-        if re.fullmatch(r"\d{5,}", line):
-            continue
-        if re.fullmatch(r"\d{2}\.\d{2}\.\d{2}", line):
-            continue
-        if re.fullmatch(r"\d+", line):
+        # oddělovače
+        if "====" in line:
             continue
 
         cleaned_lines.append(line)
 
-    # hlavní řádek položky:
-    # 0704400 20,00 Riemen 0,17 3,40
+    # hlavní řádek položky
     item_re = re.compile(
-        r"""
-        ^
-        (?P<idno>\d{6,})\s+
-        (?P<qty>\d+,\d{2})\s+
-        (?P<desc>.+?)\s+
-        (?P<price>\d+,\d{2})\s+
-        (?P<total>\d+,\d{2})
-        $
-        """,
-        re.VERBOSE,
+        r"^(\d{6,})\s+(\d+,\d{2})\s+(.+?)\s+(\d+,\d{2})\s+(\d+,\d{2})$"
     )
 
     i = 0
@@ -503,47 +467,32 @@ def parse_classic(lines: list[str]):
             i += 1
             continue
 
-        idno = m.group("idno").strip()
-        qty = cz_number_to_float(m.group("qty"))
-        desc = m.group("desc").strip()
-        total = cz_number_to_float(m.group("total"))
+        qty = cz_number_to_float(m.group(2))
+        name = m.group(3).strip()
+        total = cz_number_to_float(m.group(5))
 
-        subcode = ""
-        subnote = ""
+        internal_code = ""
 
-        # další řádek bývá např. BLT17044 / CDM31294-ORI / PSE50255 EU
+        # 🔑 druhý řádek = správný kód (BLTxxxxx)
         if i + 1 < len(cleaned_lines):
-            nxt = cleaned_lines[i + 1]
-            if not item_re.match(nxt):
-                # není to další hlavní položka
-                subcode = nxt.strip()
+            next_line = cleaned_lines[i + 1].strip()
 
-                # třetí řádek bývá např. classic-03 / classic-02
-                if i + 2 < len(cleaned_lines):
-                    nxt2 = cleaned_lines[i + 2]
-                    if not item_re.match(nxt2):
-                        # nepobereme souhrny ani konce stránky
-                        if not nxt2.startswith("Goods Value") and not nxt2.startswith("VAT") and nxt2 != "= 1 carton":
-                            subnote = nxt2.strip()
-                            i += 1  # posun navíc za třetí řádek
-                i += 1  # posun navíc za druhý řádek
+            # musí obsahovat písmena + čísla
+            if re.match(r"^[A-Z0-9\- ]+$", next_line):
+                internal_code = next_line
+                i += 1
 
-        # mapování do současného v2 schématu
-        # Interní kód zboží = první kód z řádku (Id.-No.)
-        # Název = Description
-        # Zkrácená poznámka = 2. a 3. řádek položky
-        note_parts = []
-        if subcode:
-            note_parts.append(subcode)
-        if subnote:
-            note_parts.append(subnote)
+        # ❌ vynechání dopravy
+        if "FRA" in internal_code or "FREIGHT" in name.upper():
+            i += 1
+            continue
 
         items.append({
-            "Interní kód zboží": idno,
-            "Název": desc,
+            "Interní kód zboží": internal_code,
+            "Název": name,
             "Množství": qty,
             "Cena celkem": total,
-            "Zkrácená poznámka": " | ".join(note_parts),
+            "Zkrácená poznámka": "",
             "Kód kombinované nomenklatury": "",
             "Země původu": "",
             "Hmotnost": "",
@@ -551,7 +500,7 @@ def parse_classic(lines: list[str]):
 
         i += 1
 
-    return items, warnings
+    return items, warnings  
     
 
 # =========================
