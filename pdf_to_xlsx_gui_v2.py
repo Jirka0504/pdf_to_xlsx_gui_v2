@@ -67,6 +67,9 @@ def detect_supplier(lines: list[str]) -> str:
     if "omnia components" in text or "product code description quantity prezzo" in text:
         return "OMNIA"
 
+    if "classic service parts gmbh" in text or "invoice no." in text and "priceeur" in text and "totaleur" in text:
+        return "CLASSIC"
+
     return "UNKNOWN"
 
 
@@ -407,6 +410,150 @@ def parse_omnia(lines: list[str]):
         i += 1
 
     return items, warnings
+
+# =========================
+# OMNIA PARSER
+# =========================
+
+def parse_classic(lines: list[str]):
+    items = []
+    warnings = []
+
+    cleaned_lines = []
+    skip_prefixes = (
+        "KTS - AME s.r.o.",
+        "Karla Capka 60/13",
+        "CZ 50002 Hradec Kralove",
+        "Tschechische Republik",
+        "Invoice",
+        "Invoice No.",
+        "Date = delivery date",
+        "Page",
+        "Account No.",
+        "Classic Service Parts GmbH",
+        "Rodensteiner Str.",
+        "64385 Reichelsheim/Germany",
+        "Tel.",
+        "Fax.",
+        "E-mail:",
+        "EORI:",
+        "www.classic-serviceparts.com",
+        "Managing Director:",
+        "Sparkasse Odenwaldkreis",
+        "CZ42194407VAT-ID-Nr.",
+        "VAT-ID-Nr.",
+        "Lieferschein:",
+        "Ihre Bestellangaben:",
+        "DPD",
+        "Tracking :",
+        "CIP Hradec Kralove",
+        "Goods Value",
+        "VAT %",
+        "VAT",
+        "Total Amount",
+        "payment within 30 days after invoice date, net !",
+        ">>>> tax free intracommunity delivery <<<<",
+        "EUR",
+        "grossweight :",
+    )
+
+    for raw in lines:
+        line = normalize_text(raw)
+        if not line:
+            continue
+
+        if any(line.startswith(prefix) for prefix in skip_prefixes):
+            continue
+
+        # čistě technické / hlavičkové řádky
+        if line in ("==============================", "= 1 carton"):
+            continue
+
+        # řádky s číslem faktury / stránkou / účtem
+        if re.fullmatch(r"\d{5,}", line):
+            continue
+        if re.fullmatch(r"\d{2}\.\d{2}\.\d{2}", line):
+            continue
+        if re.fullmatch(r"\d+", line):
+            continue
+
+        cleaned_lines.append(line)
+
+    # hlavní řádek položky:
+    # 0704400 20,00 Riemen 0,17 3,40
+    item_re = re.compile(
+        r"""
+        ^
+        (?P<idno>\d{6,})\s+
+        (?P<qty>\d+,\d{2})\s+
+        (?P<desc>.+?)\s+
+        (?P<price>\d+,\d{2})\s+
+        (?P<total>\d+,\d{2})
+        $
+        """,
+        re.VERBOSE,
+    )
+
+    i = 0
+    while i < len(cleaned_lines):
+        line = cleaned_lines[i]
+        m = item_re.match(line)
+
+        if not m:
+            i += 1
+            continue
+
+        idno = m.group("idno").strip()
+        qty = cz_number_to_float(m.group("qty"))
+        desc = m.group("desc").strip()
+        total = cz_number_to_float(m.group("total"))
+
+        subcode = ""
+        subnote = ""
+
+        # další řádek bývá např. BLT17044 / CDM31294-ORI / PSE50255 EU
+        if i + 1 < len(cleaned_lines):
+            nxt = cleaned_lines[i + 1]
+            if not item_re.match(nxt):
+                # není to další hlavní položka
+                subcode = nxt.strip()
+
+                # třetí řádek bývá např. classic-03 / classic-02
+                if i + 2 < len(cleaned_lines):
+                    nxt2 = cleaned_lines[i + 2]
+                    if not item_re.match(nxt2):
+                        # nepobereme souhrny ani konce stránky
+                        if not nxt2.startswith("Goods Value") and not nxt2.startswith("VAT") and nxt2 != "= 1 carton":
+                            subnote = nxt2.strip()
+                            i += 1  # posun navíc za třetí řádek
+                i += 1  # posun navíc za druhý řádek
+
+        # mapování do současného v2 schématu
+        # Interní kód zboží = první kód z řádku (Id.-No.)
+        # Název = Description
+        # Zkrácená poznámka = 2. a 3. řádek položky
+        note_parts = []
+        if subcode:
+            note_parts.append(subcode)
+        if subnote:
+            note_parts.append(subnote)
+
+        items.append({
+            "Interní kód zboží": idno,
+            "Název": desc,
+            "Množství": qty,
+            "Cena celkem": total,
+            "Zkrácená poznámka": " | ".join(note_parts),
+            "Kód kombinované nomenklatury": "",
+            "Země původu": "",
+            "Hmotnost": "",
+        })
+
+        i += 1
+
+    return items, warnings
+    
+
 # =========================
 # SAVE XLSX
 # =========================
@@ -480,10 +627,11 @@ class App(tk.Tk):
 
         note = (
             "Verze 2:\n"
-            "• Automatická detekce ASWO / OMNIA\n"
+            "• Automatická detekce ASWO / OMNIA / CLASSIC\n"
             "• ASWO: množství = dodávané množství\n"
             "• ASWO: cena celkem = celková cena + poměrné logistické náklady\n"
-            "• OMNIA: umí i rozdělený kód na dalším řádku"
+            "• OMNIA: umí i rozdělený kód na dalším řádku\n"
+            "• CLASSIC: umí 2–3 řádkové položky (Id-No. / druhý kód / poznámka)"
         )
         ttk.Label(frm, text=note, foreground="#555", justify="left").grid(row=4, column=0, columnspan=3, sticky="w", pady=(0, 10))
 
@@ -537,6 +685,8 @@ class App(tk.Tk):
             return parse_aswo(lines), supplier
         if supplier == "OMNIA":
             return parse_omnia(lines), supplier
+        if supplier == "CLASSIC":
+            return parse_classic(lines), supplier
 
         raise ValueError("Nepodařilo se rozpoznat typ PDF. Tento dokument zatím není podporovaný.")
 
