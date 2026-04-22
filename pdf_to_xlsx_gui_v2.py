@@ -263,10 +263,12 @@ def parse_omnia(lines: list[str]):
         re.VERBOSE,
     )
 
-    split_row_re = re.compile(
+    # pokračovací řádek:
+    # LOWER COFFEE MACHINE GEAR SUPPORT - 149198350 2 PZ 0.81 € 1.62 €
+    cont_row_re = re.compile(
         r"""
         ^
-        (?P<name>.+?)\s*-\s+
+        (?P<name>.+?)\s*-\s*
         (?P<tail_code>[A-Z0-9\-.]+)\s+
         (?P<qty>\d+)\s+PZ\s+
         (?P<price>\d+(?:\.\d{2}))\s+€\s+
@@ -306,7 +308,13 @@ def parse_omnia(lines: list[str]):
     pending_prefix = None
 
     for raw_line in lines:
-        line = normalize_text(raw_line).replace("￾", "")
+        line = normalize_text(raw_line)
+
+        # OCR šum
+        line = line.replace("￾", "").strip()
+
+        if not line:
+            continue
 
         if any(line.startswith(prefix) for prefix in skip_prefixes):
             continue
@@ -330,23 +338,24 @@ def parse_omnia(lines: list[str]):
             pending_prefix = None
             continue
 
-        # 2) případ slepeného prefixu + pokračování kódu, např. VEN149198350
-        # chceme z toho udělat prefix VEN-
-        m_prefix = re.fullmatch(r"([A-Z]{2,10})(\d{5,})", line)
-        if m_prefix:
-            pending_prefix = m_prefix.group(1).strip() + "-"
-            continue
-
-        # 3) případ samostatného prefixu zakončeného pomlčkou, např. VEN-
+        # 2) pokud je na řádku jen začátek kódu zakončený pomlčkou, např. VEN-
         if re.fullmatch(r"[A-Z0-9]+-$", line):
             pending_prefix = line.strip()
             continue
 
-        # 4) pokud čekáme na pokračování, vezmeme další řádek
+        # 3) pokud OCR slepí prefix a pokračování do jednoho řádku, např. VEN149198350
+        # chceme z toho vzít prefix VEN-
+        m_joined = re.fullmatch(r"(?P<prefix>[A-Z]{2,10})(?P<tail>\d{5,})", line)
+        if m_joined:
+            pending_prefix = m_joined.group("prefix") + "-"
+            continue
+
+        # 4) pokud čekáme na pokračování kódu, další řádek musí dodat konec kódu
         if pending_prefix:
-            m2 = split_row_re.match(line)
+            m2 = cont_row_re.match(line)
             if m2:
                 full_code = pending_prefix + m2.group("tail_code").strip()
+
                 items.append({
                     "Interní kód zboží": full_code,
                     "Název": m2.group("name").strip(),
@@ -360,39 +369,11 @@ def parse_omnia(lines: list[str]):
                 pending_prefix = None
                 continue
 
-            # fallback: kdyby další řádek nezačínal názvem s pomlčkou
-            m3 = re.match(
-                r"""
-                ^
-                (?P<tail_code>[A-Z0-9\-.]+)\s+
-                (?P<name>.+?)\s+
-                (?P<qty>\d+)\s+PZ\s+
-                (?P<price>\d+(?:\.\d{2}))\s+€\s+
-                (?P<total>\d+(?:\.\d{2}))\s+€
-                $
-                """,
-                line,
-                re.VERBOSE,
-            )
-            if m3:
-                full_code = pending_prefix + m3.group("tail_code").strip()
-                items.append({
-                    "Interní kód zboží": full_code,
-                    "Název": m3.group("name").strip(),
-                    "Množství": int(m3.group("qty")),
-                    "Cena celkem": en_number_to_float(m3.group("total")),
-                    "Zkrácená poznámka": "",
-                    "Kód kombinované nomenklatury": "",
-                    "Země původu": "",
-                    "Hmotnost": "",
-                })
-                pending_prefix = None
-                continue
-
-        # neparsované řádky jen ignorujeme
+            # fallback: kdyby se další řádek nepodařilo naparsovat,
+            # prefix necháme ještě jeden cyklus žít
+            continue
 
     return items, warnings
-
 # =========================
 # SAVE XLSX
 # =========================
