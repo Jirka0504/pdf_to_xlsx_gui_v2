@@ -252,70 +252,34 @@ def parse_omnia(lines: list[str]):
     warnings = []
 
     full_row_re = re.compile(
-        r"""
-        ^
-        (?P<code>[A-Z0-9\-.]+)\s+
-        (?P<name>.+?)\s+
-        (?P<qty>\d+)\s+PZ\s+
-        (?P<price>\d+(?:\.\d{2}))\s+€\s+
-        (?P<total>\d+(?:\.\d{2}))\s+€
-        $
-        """,
-        re.VERBOSE,
+        r"^(?P<code>[A-Z0-9\-.]+)\s+(?P<name>.+?)\s+(?P<qty>\d+)\s+PZ\s+(?P<price>\d+(?:\.\d{2}))\s+€\s+(?P<total>\d+(?:\.\d{2}))\s+€$"
     )
 
-    cont_after_code_re = re.compile(
-        r"""
-        ^
-        (?P<name>.+?)\s+
-        (?P<qty>\d+)\s+PZ\s+
-        (?P<price>\d+(?:\.\d{2}))\s+€\s+
-        (?P<total>\d+(?:\.\d{2}))\s+€
-        $
-        """,
-        re.VERBOSE,
+    name_qty_re = re.compile(
+        r"^(?P<name>.+?)\s+(?P<qty>\d+)\s+PZ\s+(?P<price>\d+(?:\.\d{2}))\s+€\s+(?P<total>\d+(?:\.\d{2}))\s+€$"
     )
 
     skip_prefixes = (
-        "Consegnare a:",
-        "Spettabile:",
-        "Vat code:",
-        "TOTALE MERCE",
-        "SCONTO %",
-        "SPESE INCASSO",
-        "TOTALE IMPONIBILE",
-        "TOTALE IMPOSTA",
-        "IMPONIBILE",
-        "ALIQUOTA IVA",
-        "TOTALE DOCUMENTO",
-        "OMAGGI",
-        "TOTALE DA PAGARE",
-        "FATTURA",
-        "OMNIA COMPONENTS",
-        "Via Travnik",
-        "Tel.",
-        "C.F. E P.IVA",
-        "Capitale Sociale",
-        "N.Documento",
-        "Data spedizione richiesta:",
-        "http://www.omniacomponents.com",
+        "Consegnare a:", "Spettabile:", "Vat code:", "TOTALE MERCE",
+        "SCONTO %", "SPESE INCASSO", "TOTALE IMPONIBILE", "TOTALE IMPOSTA",
+        "IMPONIBILE", "ALIQUOTA IVA", "TOTALE DOCUMENTO", "OMAGGI",
+        "TOTALE DA PAGARE", "FATTURA", "OMNIA COMPONENTS", "Via Travnik",
+        "Tel.", "C.F. E P.IVA", "Capitale Sociale", "N.Documento",
+        "Data spedizione richiesta:", "http://www.omniacomponents.com",
         "PRODUCT CODE DESCRIPTION QUANTITY PREZZO SCONTO % IMPORTO TOTALE",
         "Spese di Trasporto UE Vendita - Shipping Fees",
     )
 
     cleaned_lines = []
     for raw in lines:
-        # DŮLEŽITÉ: znak ￾ znamená rozdělenou pomlčku v kódu
         line = str(raw).replace("￾", "-")
         line = normalize_text(line)
-
         if not line:
             continue
         if any(line.startswith(prefix) for prefix in skip_prefixes):
             continue
         if line.startswith("KTS - AME") or line.startswith("Karla Čapka") or line.startswith("500 02"):
             continue
-
         cleaned_lines.append(line)
 
     i = 0
@@ -338,24 +302,45 @@ def parse_omnia(lines: list[str]):
             i += 1
             continue
 
-        # 2) řádek obsahuje pouze hotový kód, další řádek obsahuje název + množství + cenu
-        # např. SS-1600007234 / další řádek .3D/CROCHET/NOIR 1 PZ 7.02 € 7.02 €
-        if re.fullmatch(r"[A-Z]{2,10}-[A-Z0-9.\-]+", line):
-            if i + 1 < len(cleaned_lines):
-                next_line = cleaned_lines[i + 1]
-                m2 = cont_after_code_re.match(next_line)
-                if m2:
-                    name = m2.group("name").strip()
+        # 2) třířádkový rozpad:
+        # SS-
+        # .3D/CROCHET/NOIR 1 PZ 7.02 € 7.02 €
+        # 1600007234
+        if re.fullmatch(r"[A-Z]{2,10}-$", line):
+            if i + 2 < len(cleaned_lines):
+                middle_line = cleaned_lines[i + 1]
+                tail_code_line = cleaned_lines[i + 2]
 
-                    # pokud další řádek obsahuje na konci "- 149198350", odstraníme duplicitní kód z názvu
-                    tail = line.split("-", 1)[1]
-                    name = re.sub(rf"\s*-\s*{re.escape(tail)}$", "", name).strip()
+                m2 = name_qty_re.match(middle_line)
+
+                if m2 and re.fullmatch(r"[A-Z0-9.\-]+", tail_code_line):
+                    full_code = line + tail_code_line
 
                     items.append({
-                        "Interní kód zboží": line,
-                        "Název": name,
+                        "Interní kód zboží": full_code,
+                        "Název": m2.group("name").strip(),
                         "Množství": int(m2.group("qty")),
                         "Cena celkem": en_number_to_float(m2.group("total")),
+                        "Zkrácená poznámka": "",
+                        "Kód kombinované nomenklatury": "",
+                        "Země původu": "",
+                        "Hmotnost": "",
+                    })
+                    i += 3
+                    continue
+
+        # 3) dvouřádkový rozpad:
+        # SS-1600007234
+        # .3D/CROCHET/NOIR 1 PZ 7.02 € 7.02 €
+        if re.fullmatch(r"[A-Z]{2,10}-[A-Z0-9.\-]+", line):
+            if i + 1 < len(cleaned_lines):
+                m3 = name_qty_re.match(cleaned_lines[i + 1])
+                if m3:
+                    items.append({
+                        "Interní kód zboží": line.strip(),
+                        "Název": m3.group("name").strip(),
+                        "Množství": int(m3.group("qty")),
+                        "Cena celkem": en_number_to_float(m3.group("total")),
                         "Zkrácená poznámka": "",
                         "Kód kombinované nomenklatury": "",
                         "Země původu": "",
