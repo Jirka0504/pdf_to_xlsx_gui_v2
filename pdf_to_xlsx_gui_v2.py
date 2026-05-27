@@ -40,10 +40,8 @@ def en_number_to_float(value: str) -> float:
     return float(value)
 
 
-def float_to_cz_string(value: float) -> str:
-    s = f"{value:,.2f}"
-    s = s.replace(",", "X").replace(".", ",").replace("X", "\xa0")
-    return s
+def float_to_dot_string(value: float) -> str:
+    return f"{float(value):.2f}"
 
 
 def extract_pdf_lines(pdf_path: str):
@@ -266,6 +264,18 @@ def parse_omnia(lines: list[str]):
         re.VERBOSE,
     )
 
+    cont_after_code_re = re.compile(
+        r"""
+        ^
+        (?P<name>.+?)\s+
+        (?P<qty>\d+)\s+PZ\s+
+        (?P<price>\d+(?:\.\d{2}))\s+€\s+
+        (?P<total>\d+(?:\.\d{2}))\s+€
+        $
+        """,
+        re.VERBOSE,
+    )
+
     skip_prefixes = (
         "Consegnare a:",
         "Spettabile:",
@@ -293,72 +303,26 @@ def parse_omnia(lines: list[str]):
         "Spese di Trasporto UE Vendita - Shipping Fees",
     )
 
-    def try_parse_split(prefix_code: str, next_line: str):
-        """
-        Prefix z prvního řádku:
-            VEN-
-        nebo OCR slepené:
-            VEN149198350  -> prefix VEN-
-
-        Druhý řádek:
-            LOWER COFFEE MACHINE GEAR SUPPORT - 149198350 2 PZ 0.81 € 1.62 €
-        """
-        line = normalize_text(next_line).replace("￾", "").strip()
-
-        m = re.match(
-            r"""
-            ^
-            (?P<name>.+?)           # název zboží
-            \s*-\s*
-            (?P<tail>\d{5,})        # pokračování kódu
-            \s+
-            (?P<qty>\d+)
-            \s+PZ\s+
-            (?P<price>\d+(?:\.\d{2}))
-            \s+€\s+
-            (?P<total>\d+(?:\.\d{2}))
-            \s+€
-            $
-            """,
-            line,
-            re.VERBOSE,
-        )
-        if not m:
-            return None
-
-        tail = m.group("tail").strip()
-        full_code = prefix_code + tail
-        name = m.group("name").strip()
-        qty = int(m.group("qty"))
-        total = en_number_to_float(m.group("total"))
-
-        return {
-            "Interní kód zboží": full_code,
-            "Název": name,
-            "Množství": qty,
-            "Cena celkem": total,
-            "Zkrácená poznámka": "",
-            "Kód kombinované nomenklatury": "",
-            "Země původu": "",
-            "Hmotnost": "",
-        }
-
     cleaned_lines = []
     for raw in lines:
-        line = normalize_text(raw).replace("￾", "").strip()
+        # DŮLEŽITÉ: znak ￾ znamená rozdělenou pomlčku v kódu
+        line = str(raw).replace("￾", "-")
+        line = normalize_text(line)
+
         if not line:
             continue
         if any(line.startswith(prefix) for prefix in skip_prefixes):
             continue
         if line.startswith("KTS - AME") or line.startswith("Karla Čapka") or line.startswith("500 02"):
             continue
+
         cleaned_lines.append(line)
 
     i = 0
     while i < len(cleaned_lines):
         line = cleaned_lines[i]
 
-        # 1) normální kompletní řádek
+        # 1) běžný kompletní řádek
         m = full_row_re.match(line)
         if m:
             items.append({
@@ -374,38 +338,31 @@ def parse_omnia(lines: list[str]):
             i += 1
             continue
 
-        # 2) případ prefixu zakončeného pomlčkou, např. VEN-
-        if re.fullmatch(r"[A-Z0-9]+-$", line):
-            prefix_code = line
+        # 2) řádek obsahuje pouze hotový kód, další řádek obsahuje název + množství + cenu
+        # např. SS-1600007234 / další řádek .3D/CROCHET/NOIR 1 PZ 7.02 € 7.02 €
+        if re.fullmatch(r"[A-Z]{2,10}-[A-Z0-9.\-]+", line):
             if i + 1 < len(cleaned_lines):
-                parsed = try_parse_split(prefix_code, cleaned_lines[i + 1])
-                if parsed:
-                    items.append(parsed)
+                next_line = cleaned_lines[i + 1]
+                m2 = cont_after_code_re.match(next_line)
+                if m2:
+                    name = m2.group("name").strip()
+
+                    # pokud další řádek obsahuje na konci "- 149198350", odstraníme duplicitní kód z názvu
+                    tail = line.split("-", 1)[1]
+                    name = re.sub(rf"\s*-\s*{re.escape(tail)}$", "", name).strip()
+
+                    items.append({
+                        "Interní kód zboží": line,
+                        "Název": name,
+                        "Množství": int(m2.group("qty")),
+                        "Cena celkem": en_number_to_float(m2.group("total")),
+                        "Zkrácená poznámka": "",
+                        "Kód kombinované nomenklatury": "",
+                        "Země původu": "",
+                        "Hmotnost": "",
+                    })
                     i += 2
                     continue
-
-        # 3) OCR slepený případ: VEN149198350
-        # z toho chceme udělat prefix VEN-
-        m_joined = re.fullmatch(r"(?P<prefix>[A-Z]{2,10})(?P<tail>\d{5,})", line)
-        if m_joined:
-            prefix_code = m_joined.group("prefix") + "-"
-            if i + 1 < len(cleaned_lines):
-                parsed = try_parse_split(prefix_code, cleaned_lines[i + 1])
-                if parsed:
-                    items.append(parsed)
-                    i += 2
-                    continue
-
-        # 4) fallback: když by první řádek byl už přesně VEN149198350 a druhý řádek nešel,
-        # zkusíme prefix určit jen podle písmen na začátku
-        m_prefix_only = re.match(r"^([A-Z]{2,10})", line)
-        if m_prefix_only and i + 1 < len(cleaned_lines):
-            prefix_code = m_prefix_only.group(1) + "-"
-            parsed = try_parse_split(prefix_code, cleaned_lines[i + 1])
-            if parsed:
-                items.append(parsed)
-                i += 2
-                continue
 
         i += 1
 
@@ -521,7 +478,7 @@ def save_xlsx(output_path: str, rows: list[dict]):
         ws.cell(row=row_no, column=1, value=row["Interní kód zboží"])
         ws.cell(row=row_no, column=2, value=row["Název"])
         ws.cell(row=row_no, column=3, value=row["Množství"])
-        ws.cell(row=row_no, column=4, value=float_to_cz_string(row["Cena celkem"]))
+        ws.cell(row=row_no, column=4, value=float_to_dot_string(row["Cena celkem"]))
         ws.cell(row=row_no, column=5, value=row["Zkrácená poznámka"])
         ws.cell(row=row_no, column=6, value=int(row["Kód kombinované nomenklatury"]) if str(row["Kód kombinované nomenklatury"]).isdigit() else row["Kód kombinované nomenklatury"])
         ws.cell(row=row_no, column=7, value=row["Země původu"])
@@ -653,7 +610,7 @@ class App(tk.Tk):
         for row in rows[:40]:
             self.preview_box.insert(
                 "end",
-                f"{row['Interní kód zboží']} | {row['Název']} | qty={row['Množství']} | total={float_to_cz_string(row['Cena celkem'])}\n"
+                f"{row['Interní kód zboží']} | {row['Název']} | qty={row['Množství']} | total={float_to_dot_string(row['Cena celkem'])}\n"
             )
 
         if warnings:
