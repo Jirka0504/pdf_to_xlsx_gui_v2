@@ -12,7 +12,7 @@ APP_TITLE = "PDF → XLSX GUI v2 (ASWO + OMNIA)"
 
 
 HEADERS = [
-    "Interní kód zboží",
+    "Kód zboží dodavatele",
     "Název",
     "Množství",
     "Cena celkem",
@@ -67,6 +67,9 @@ def detect_supplier(lines: list[str]) -> str:
 
     if "classic service parts gmbh" in text or "invoice no." in text and "priceeur" in text and "totaleur" in text:
         return "CLASSIC"
+
+    if "vor spol. s r.o." in text or "cenabezdph" in text or "dodací list" in text:
+        return "VOR"
 
     return "UNKNOWN"
 
@@ -230,7 +233,7 @@ def parse_aswo(lines: list[str]):
     for item in items:
         total_with_logistics = item["total_base"] + item["logistics"]
         result.append({
-            "Interní kód zboží": item["code"],
+            "Kód zboží dodavatele": item["code"],
             "Název": item["name"],
             "Množství": item["qty"],
             "Cena celkem": total_with_logistics,
@@ -290,7 +293,7 @@ def parse_omnia(lines: list[str]):
         m = full_row_re.match(line)
         if m:
             items.append({
-                "Interní kód zboží": m.group("code").strip(),
+                "Kód zboží dodavatele": m.group("code").strip(),
                 "Název": m.group("name").strip(),
                 "Množství": int(m.group("qty")),
                 "Cena celkem": en_number_to_float(m.group("total")),
@@ -317,7 +320,7 @@ def parse_omnia(lines: list[str]):
                     full_code = line + tail_code_line
 
                     items.append({
-                        "Interní kód zboží": full_code,
+                        "Kód zboží dodavatele": full_code,
                         "Název": m2.group("name").strip(),
                         "Množství": int(m2.group("qty")),
                         "Cena celkem": en_number_to_float(m2.group("total")),
@@ -337,7 +340,7 @@ def parse_omnia(lines: list[str]):
                 m3 = name_qty_re.match(cleaned_lines[i + 1])
                 if m3:
                     items.append({
-                        "Interní kód zboží": line.strip(),
+                        "Kód zboží dodavatele": line.strip(),
                         "Název": m3.group("name").strip(),
                         "Množství": int(m3.group("qty")),
                         "Cena celkem": en_number_to_float(m3.group("total")),
@@ -430,7 +433,7 @@ def parse_classic(lines: list[str]):
             continue
 
         items.append({
-            "Interní kód zboží": internal_code,
+            "Kód zboží dodavatele": internal_code,
             "Název": name,
             "Množství": qty,
             "Cena celkem": total,
@@ -443,6 +446,144 @@ def parse_classic(lines: list[str]):
         i += 1
 
     return items, warnings  
+
+# =========================
+# VOR PARSER
+# =========================
+
+def parse_vor(lines: list[str]):
+    items = []
+    warnings = []
+
+    item_start_re = re.compile(
+        r"""
+        ^
+        (?P<code>\d{2}\s+\S+)\s+
+        (?P<qty>\d+)\s+ks\s+
+        (?P<rest>.+)
+        $
+        """,
+        re.VERBOSE,
+    )
+
+    price_tail_re = re.compile(
+        r"""
+        (?P<name>.+?)\s+
+        (?P<unit_price>\d{1,3}(?:,\d{3})*\.\d{3})\s+
+        (?P<vat>\d{1,2})\s+
+        (?P<vat_amount>\d{1,3}(?:,\d{3})*\.\d{2})\s+
+        (?P<total_vat>\d{1,3}(?:,\d{3})*\.\d{2})\s*Kč?
+        $
+        """,
+        re.VERBOSE,
+    )
+
+    def to_float_vor(value: str) -> float:
+        return float(value.replace(",", ""))
+
+    cleaned = []
+    skip_prefixes = (
+        "Daňový doklad",
+        "Variabilní symbol",
+        "DODACÍ LIST",
+        "Pokud nebyla",
+        "Prodávající",
+        "Kupující",
+        "Banka:",
+        "Účet/Kód banky:",
+        "SWIFT:",
+        "IBAN:",
+        "Komerční banka",
+        "KTS - AME",
+        "Karla Čapka",
+        "Kosice",
+        "Dodací adresa:",
+        "Datum UZP:",
+        "Datum vystavení:",
+        "Datum splatnosti:",
+        "Způsob platby:",
+        "Doprava:",
+        "Zboží",
+        "/MJ",
+        "doklad č.",
+        "KUPNÍ SMLOUVA",
+        "Po zaokrouhlení",
+        "Základní sazba",
+        "Zaplaceno",
+        "Celkem k úhradě",
+        "V cenové skupině",
+        "Za obaly",
+        "Kontrola expedice",
+        "Datum:",
+        "V souladu",
+        "Fakturu vystavil",
+        "Picture:",
+        "Document",
+        "Převzal",
+    )
+
+    for raw in lines:
+        line = normalize_text(str(raw))
+        if not line:
+            continue
+        if any(line.startswith(p) for p in skip_prefixes):
+            continue
+        cleaned.append(line)
+
+    i = 0
+    while i < len(cleaned):
+        line = cleaned[i]
+        m = item_start_re.match(line)
+
+        if not m:
+            i += 1
+            continue
+
+        code = m.group("code").strip()
+        qty = int(m.group("qty"))
+        rest = m.group("rest").strip()
+
+        j = i + 1
+        combined = rest
+
+        while j < len(cleaned):
+            next_line = cleaned[j]
+
+            if item_start_re.match(next_line):
+                break
+            if next_line.startswith("Po zaokrouhlení") or next_line.startswith("Základní sazba") or next_line.startswith("Celkem"):
+                break
+
+            combined += " " + next_line
+            j += 1
+
+            if price_tail_re.search(combined):
+                break
+
+        pm = price_tail_re.search(combined)
+        if not pm:
+            warnings.append(f"VOR: nepodařilo se naparsovat položku: {line}")
+            i += 1
+            continue
+
+        name = pm.group("name").strip()
+        unit_price = to_float_vor(pm.group("unit_price"))
+        total = qty * unit_price
+
+        items.append({
+            "Kód zboží dodavatele": code,
+            "Název": name,
+            "Množství": qty,
+            "Cena celkem": total,
+            "Zkrácená poznámka": "",
+            "Kód kombinované nomenklatury": "",
+            "Země původu": "",
+            "Hmotnost": "",
+        })
+
+        i = j + 1
+
+    return items, warnings
     
 
 # =========================
@@ -460,7 +601,7 @@ def save_xlsx(output_path: str, rows: list[dict]):
 
     row_no = 2
     for row in rows:
-        ws.cell(row=row_no, column=1, value=row["Interní kód zboží"])
+        ws.cell(row=row_no, column=1, value=row["Kód zboží dodavatele"])
         ws.cell(row=row_no, column=2, value=row["Název"])
         ws.cell(row=row_no, column=3, value=row["Množství"])
         ws.cell(row=row_no, column=4, value=float_to_dot_string(row["Cena celkem"]))
@@ -578,6 +719,8 @@ class App(tk.Tk):
             return parse_omnia(lines), supplier
         if supplier == "CLASSIC":
             return parse_classic(lines), supplier
+        if supplier == "VOR":
+            return parse_vor(lines), supplier
 
         raise ValueError("Nepodařilo se rozpoznat typ PDF. Tento dokument zatím není podporovaný.")
 
@@ -595,7 +738,7 @@ class App(tk.Tk):
         for row in rows[:40]:
             self.preview_box.insert(
                 "end",
-                f"{row['Interní kód zboží']} | {row['Název']} | qty={row['Množství']} | total={float_to_dot_string(row['Cena celkem'])}\n"
+                f"{row['Kód zboží dodavatele']} | {row['Název']} | qty={row['Množství']} | total={float_to_dot_string(row['Cena celkem'])}\n"
             )
 
         if warnings:
