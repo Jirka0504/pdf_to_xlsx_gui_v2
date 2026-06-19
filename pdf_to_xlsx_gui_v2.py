@@ -455,33 +455,31 @@ def parse_vor(lines: list[str]):
     items = []
     warnings = []
 
-    item_start_re = re.compile(
+    item_start_re = re.compile(r"^\d{2}\s+\S+\s+\d+\s+ks\s+")
+
+    item_re = re.compile(
         r"""
         ^
         (?P<code>\d{2}\s+\S+)\s+
         (?P<qty>\d+)\s+ks\s+
-        (?P<rest>.+)
+        (?P<body>.+?)
+        \s+
+        (?P<unit_price>\d+(?:\.\d{3}))
+        \s+
+        (?P<vat>\d{1,2})
+        \s+
+        (?P<vat_amount>\d+(?:,\d{3})*\.\d{2})
+        \s+
+        (?P<total_vat>\d+(?:,\d{3})*\.\d{2})\s*Kč?
         $
         """,
         re.VERBOSE,
     )
 
-    price_tail_re = re.compile(
-        r"""
-        (?P<name>.+?)\s+
-        (?P<unit_price>\d{1,3}(?:,\d{3})*\.\d{3})\s+
-        (?P<vat>\d{1,2})\s+
-        (?P<vat_amount>\d{1,3}(?:,\d{3})*\.\d{2})\s+
-        (?P<total_vat>\d{1,3}(?:,\d{3})*\.\d{2})\s*Kč?
-        $
-        """,
-        re.VERBOSE,
+    stop_re = re.compile(
+        r"^(Po zaokrouhlení|Základní sazba|Zaplaceno|Celkem k úhradě|V cenové skupině|Za obaly|Kontrola expedice|Datum:|Fakturu vystavil|doklad č\.)"
     )
 
-    def to_float_vor(value: str) -> float:
-        return float(value.replace(",", ""))
-
-    cleaned = []
     skip_prefixes = (
         "Daňový doklad",
         "Variabilní symbol",
@@ -505,72 +503,60 @@ def parse_vor(lines: list[str]):
         "Doprava:",
         "Zboží",
         "/MJ",
-        "doklad č.",
         "KUPNÍ SMLOUVA",
-        "Po zaokrouhlení",
-        "Základní sazba",
-        "Zaplaceno",
-        "Celkem k úhradě",
-        "V cenové skupině",
-        "Za obaly",
-        "Kontrola expedice",
-        "Datum:",
-        "V souladu",
-        "Fakturu vystavil",
-        "Picture:",
-        "Document",
-        "Převzal",
     )
 
+    cleaned = []
     for raw in lines:
         line = normalize_text(str(raw))
         if not line:
             continue
         if any(line.startswith(p) for p in skip_prefixes):
             continue
+        if stop_re.match(line):
+            continue
         cleaned.append(line)
 
     i = 0
     while i < len(cleaned):
         line = cleaned[i]
-        m = item_start_re.match(line)
+
+        if not item_start_re.match(line):
+            i += 1
+            continue
+
+        combined = line
+        j = i + 1
+
+        while j < len(cleaned):
+            nxt = cleaned[j]
+
+            if item_start_re.match(nxt):
+                break
+            if stop_re.match(nxt):
+                break
+
+            combined += " " + nxt
+            j += 1
+
+        m = item_re.match(combined)
 
         if not m:
-            i += 1
+            warnings.append(f"VOR: nepodařilo se naparsovat položku: {combined}")
+            i = j
             continue
 
         code = m.group("code").strip()
         qty = int(m.group("qty"))
-        rest = m.group("rest").strip()
-
-        j = i + 1
-        combined = rest
-
-        while j < len(cleaned):
-            next_line = cleaned[j]
-
-            if item_start_re.match(next_line):
-                break
-            if next_line.startswith("Po zaokrouhlení") or next_line.startswith("Základní sazba") or next_line.startswith("Celkem"):
-                break
-
-            combined += " " + next_line
-            j += 1
-
-            if price_tail_re.search(combined):
-                break
-
-        pm = price_tail_re.search(combined)
-        if not pm:
-            warnings.append(f"VOR: nepodařilo se naparsovat položku: {line}")
-            i += 1
-            continue
-
-        name = pm.group("name").strip()
-        unit_price = to_float_vor(pm.group("unit_price"))
+        body = m.group("body").strip()
+        unit_price = float(m.group("unit_price"))
         total = qty * unit_price
 
+        # Název = vše před //
+        name = body.split("//", 1)[0].strip()
+
         items.append({
+            "Interní kód zboží": code,
             "Kód zboží dodavatele": code,
             "Název": name,
             "Množství": qty,
@@ -581,7 +567,7 @@ def parse_vor(lines: list[str]):
             "Hmotnost": "",
         })
 
-        i = j + 1
+        i = j
 
     return items, warnings
     
