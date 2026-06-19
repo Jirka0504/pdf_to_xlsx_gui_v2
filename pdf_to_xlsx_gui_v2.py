@@ -471,6 +471,7 @@ def parse_vor(lines: list[str]):
         (?P<vat_amount>\d+(?:,\d{3})*\.\d{2})
         \s+
         (?P<total_vat>\d+(?:,\d{3})*\.\d{2})\s*Kč?
+        (?P<after>.*)
         $
         """,
         re.VERBOSE,
@@ -504,6 +505,9 @@ def parse_vor(lines: list[str]):
         "Zboží",
         "/MJ",
         "KUPNÍ SMLOUVA",
+        "strana :",
+        "1026565377",
+        "20,444.66 Kč",
     )
 
     cleaned = []
@@ -548,12 +552,16 @@ def parse_vor(lines: list[str]):
 
         code = m.group("code").strip()
         qty = int(m.group("qty"))
-        body = m.group("body").strip()
         unit_price = float(m.group("unit_price"))
         total = qty * unit_price
 
-        # Název = vše před //
-        name = body.split("//", 1)[0].strip()
+        body = m.group("body").strip()
+        after = m.group("after").strip()
+
+        full_text = (body + " " + after).strip()
+
+        # název = vše před prvním //
+        name = full_text.split("//", 1)[0].strip()
 
         items.append({
             "Interní kód zboží": code,
@@ -571,7 +579,6 @@ def parse_vor(lines: list[str]):
 
     return items, warnings
     
-
 # =========================
 # SAVE XLSX
 # =========================
