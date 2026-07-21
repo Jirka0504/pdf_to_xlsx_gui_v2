@@ -365,10 +365,15 @@ def parse_omnia(lines: list[str]):
         i += 1
 
     return items, warnings
+
+
+    # =========================
+    # OMNIA NEW PARSER
+    # =========================
     
     def parse_omnia_new(lines: list[str]):
-    items = []
-    warnings = []
+        items = []
+        warnings = []
 
     full_row_re = re.compile(
         r"""
