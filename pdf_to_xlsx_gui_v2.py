@@ -62,6 +62,13 @@ def detect_supplier(lines: list[str]) -> str:
     if "aswo czech s.r.o." in text or "číslo produktu" in text or "dodávané množství" in text:
         return "ASWO"
 
+    # NOVÝ FORMÁT OMNIA - musí být PŘED starou OMNIA detekcí
+    if (
+        "code cust. item description qty. u.m. price amount vat c." in text
+        and "omnia components srl" in text
+    ):
+        return "OMNIA_NEW"
+
     if "omnia components" in text or "product code description quantity prezzo" in text:
         return "OMNIA"
 
@@ -70,6 +77,9 @@ def detect_supplier(lines: list[str]) -> str:
 
     if "vor spol. s r.o." in text or "cenabezdph" in text or "dodací list" in text:
         return "VOR"
+
+    if ("phono-zubehör-vertrieb gmbh" in text or "analogis" in text and "art.nr." in text and "gesamtpreis" in text):
+        return "ANALOGIS"
 
     return "UNKNOWN"
 
@@ -356,6 +366,174 @@ def parse_omnia(lines: list[str]):
 
     return items, warnings
     
+    def parse_omnia_new(lines: list[str]):
+    items = []
+    warnings = []
+
+    full_row_re = re.compile(
+        r"""
+        ^
+        (?P<code>[A-Z0-9.\-]+)\s+
+        (?P<name>.+?)\s+
+        (?P<qty>\d+)\s+
+        Pcs\s+
+        (?P<price>\d+(?:,\d{2}))\s+
+        (?P<total>\d+(?:,\d{2}))\s+
+        (?P<vat>\d+)
+        $
+        """,
+        re.VERBOSE | re.IGNORECASE,
+    )
+
+    tail_re = re.compile(
+        r"""
+        ^
+        (?P<qty>\d+)\s+
+        Pcs\s+
+        (?P<price>\d+(?:,\d{2}))\s+
+        (?P<total>\d+(?:,\d{2}))\s+
+        (?P<vat>\d+)
+        $
+        """,
+        re.VERBOSE | re.IGNORECASE,
+    )
+
+    skip_prefixes = (
+        "Code Cust. Item",
+        "Shipment No.",
+        "Note:",
+        "Company Stamp",
+        "Parcel units:",
+        "Gross weight",
+        "Goods aspect:",
+        "Vat C.",
+        "Incoterm:",
+        "Shipment due to:",
+        "Shipping Agent:",
+        "Subscr. No.:",
+        "Truck. No.:",
+        "Shipping Starting Date",
+        "Driver signature:",
+        "Addresse signature:",
+        "SWIFT - Bank transfer",
+        "No. ",
+        "Via Travnik",
+        "Company subject",
+        "SDI Code:",
+        "VAT Registration",
+        "Ph:",
+        "Omnia Components Srl",
+        "KTS - AME",
+        "Czech Republic",
+        "Company:",
+        "Karla Čapka",
+        "Deliver to:",
+        "Invoice",
+        "Payment:",
+        "Paym. Method:",
+        "Net 60",
+        "Bill-to Customer",
+        "Due Dates:",
+        "Bank:",
+        "PAG",
+        "TOTAL DOCUMENT",
+        "Pursuant to",
+        "Delivery At Place",
+        "Fedex",
+    )
+
+    cleaned = []
+
+    for raw in lines:
+        line = normalize_text(str(raw))
+        if not line:
+            continue
+
+        if any(line.startswith(prefix) for prefix in skip_prefixes):
+            continue
+
+        cleaned.append(line)
+
+    i = 0
+
+    while i < len(cleaned):
+        line = cleaned[i]
+
+        # dopravu vůbec neexportovat
+        if line.startswith("TRASP.EU.VEN") or "Shipping Fees" in line:
+            i += 1
+            continue
+
+        # 1) běžný řádek
+        m = full_row_re.match(line)
+
+        if m:
+            items.append({
+                "Kód zboží dodavatele": m.group("code").strip(),
+                "Název": m.group("name").strip(),
+                "Množství": int(m.group("qty")),
+                "Cena celkem": float(m.group("total").replace(",", ".")),
+                "Zkrácená poznámka": "",
+                "Kód kombinované nomenklatury": "",
+                "Země původu": "",
+                "Hmotnost": "",
+            })
+
+            i += 1
+            continue
+
+        # 2) víceřádkový název
+        start = re.match(
+            r"^(?P<code>[A-Z0-9.\-]+)\s+(?P<name>.+)$",
+            line,
+        )
+
+        if start:
+            code = start.group("code").strip()
+
+            if code == "TRASP.EU.VEN":
+                i += 1
+                continue
+
+            name_parts = [start.group("name").strip()]
+            j = i + 1
+            found = False
+
+            while j < len(cleaned):
+                nxt = cleaned[j]
+
+                tail = tail_re.match(nxt)
+
+                if tail:
+                    items.append({
+                        "Kód zboží dodavatele": code,
+                        "Název": " ".join(name_parts).strip(),
+                        "Množství": int(tail.group("qty")),
+                        "Cena celkem": float(tail.group("total").replace(",", ".")),
+                        "Zkrácená poznámka": "",
+                        "Kód kombinované nomenklatury": "",
+                        "Země původu": "",
+                        "Hmotnost": "",
+                    })
+
+                    i = j + 1
+                    found = True
+                    break
+
+                # pokud narazíme na další kompletní položku, skončíme
+                if full_row_re.match(nxt):
+                    break
+
+                name_parts.append(nxt)
+                j += 1
+
+            if found:
+                continue
+
+        i += 1
+
+    return items, warnings
+    
 
 # =========================
 # CLASSIC PARSER
@@ -578,6 +756,140 @@ def parse_vor(lines: list[str]):
         i = j
 
     return items, warnings
+
+# =========================
+# ANALOGIS PARSER
+# =========================
+
+def parse_analogis(lines: list[str]):
+    items = []
+    warnings = []
+
+    row_re = re.compile(
+        r"""
+        ^
+        (?P<pos>\d+)\s+
+        (?P<code>\S+)\s+
+        (?P<name>.+?)\s+
+        (?P<qty>\d+)\s+
+        (?P<price>\d+(?:,\d{2}))\s*€\s+
+        (?P<total>\d+(?:,\d{2}))\s*€
+        $
+        """,
+        re.VERBOSE,
+    )
+
+    skip_prefixes = (
+        "Pos. Art.Nr.",
+        "Phono-Zubehör-Vertrieb",
+        "Fon:",
+        "Eingetragen:",
+        "Amtsgericht",
+        "Geschäftsführer:",
+        "UST-",
+        "Steuernummer:",
+        "WEEE-",
+        "Duales System:",
+        "Es gelten",
+        "Jana Kallweit",
+        "KTS - AME",
+        "Karla Capka",
+        "50002",
+        "TSCHECHISCHE",
+        "BEI ZAHLUNG",
+        "Rechnung",
+        "Rechnungsnummer:",
+        "Sachbearbeiter:",
+        "Datum:",
+        "Lieferscheinnr.",
+        "Ihre Kundennummer:",
+        "Umsatzsteuerfreie",
+        "Seite:",
+        "Übertrag",
+        "Soweit nicht anders",
+        "Zahlungsbedingungen",
+        "Nettobetrag",
+        "Mehrwertsteuer",
+        "Bruttobetrag",
+        "Die Lieferung ist",
+        "Ihre UstID",
+    )
+
+    cleaned = []
+
+    for raw in lines:
+        line = normalize_text(str(raw))
+        if not line:
+            continue
+
+        if any(line.startswith(prefix) for prefix in skip_prefixes):
+            continue
+
+        cleaned.append(line)
+
+    i = 0
+
+    while i < len(cleaned):
+        line = cleaned[i]
+        m = row_re.match(line)
+
+        if not m:
+            i += 1
+            continue
+
+        code = m.group("code").strip()
+        qty = int(m.group("qty"))
+        total = float(m.group("total").replace(",", "."))
+        name_parts = [m.group("name").strip()]
+
+        # dopravu neexportovat
+        if code.upper() == "DHL-PAKET" or "DHL-PARCEL" in line.upper():
+            i += 1
+            continue
+
+        # nedodané položky vynechat
+        if qty == 0:
+            i += 1
+            continue
+
+        j = i + 1
+
+        while j < len(cleaned):
+            nxt = cleaned[j]
+
+            # další položka
+            if row_re.match(nxt):
+                break
+
+            # konec tabulky / souhrny
+            if nxt.startswith((
+                "Übertrag",
+                "Nettobetrag",
+                "Mehrwertsteuer",
+                "Bruttobetrag",
+                "Zahlungsbedingungen",
+                "Soweit nicht anders",
+            )):
+                break
+
+            name_parts.append(nxt.strip())
+            j += 1
+
+        items.append({
+            "Kód zboží dodavatele": code,
+            "Název": " ".join(name_parts).strip(),
+            "Množství": qty,
+            "Cena celkem": total,
+            "Zkrácená poznámka": "",
+            "Kód kombinované nomenklatury": "",
+            "Země původu": "",
+            "Hmotnost": "",
+        })
+
+        i = j
+
+    return items, warnings
+
     
 # =========================
 # SAVE XLSX
@@ -703,20 +1015,29 @@ class App(tk.Tk):
             return
         messagebox.showinfo("Detekce", f"Rozpoznaný typ PDF: {supplier}")
 
-    def _parse(self):
+        def _parse(self):
         lines, supplier = self._load_and_detect()
 
         if supplier == "ASWO":
             return parse_aswo(lines), supplier
+
+        if supplier == "OMNIA_NEW":
+            return parse_omnia_new(lines), supplier
+
         if supplier == "OMNIA":
             return parse_omnia(lines), supplier
+
         if supplier == "CLASSIC":
             return parse_classic(lines), supplier
+
         if supplier == "VOR":
             return parse_vor(lines), supplier
 
-        raise ValueError("Nepodařilo se rozpoznat typ PDF. Tento dokument zatím není podporovaný.")
+        if supplier == "ANALOGIS":
+            return parse_analogis(lines), supplier
 
+        raise ValueError("Nepodařilo se rozpoznat typ PDF. Tento dokument zatím není podporovaný.")
+        
     def preview(self):
         try:
             (rows, warnings), supplier = self._parse()
