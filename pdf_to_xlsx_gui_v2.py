@@ -372,8 +372,8 @@ def parse_omnia(lines: list[str]):
 # =========================
    
 def parse_omnia_new(lines: list[str]):
-        items = []
-        warnings = []
+    items = []
+    warnings = []
 
     full_row_re = re.compile(
         r"""
@@ -382,8 +382,8 @@ def parse_omnia_new(lines: list[str]):
         (?P<name>.+?)\s+
         (?P<qty>\d+)\s+
         Pcs\s+
-        (?P<price>\d+(?:,\d{2}))\s+
-        (?P<total>\d+(?:,\d{2}))\s+
+        (?P<price>\d+(?:[.,]\d{2}))\s+
+        (?P<total>\d+(?:[.,]\d{2}))\s+
         (?P<vat>\d+)
         $
         """,
@@ -395,8 +395,8 @@ def parse_omnia_new(lines: list[str]):
         ^
         (?P<qty>\d+)\s+
         Pcs\s+
-        (?P<price>\d+(?:,\d{2}))\s+
-        (?P<total>\d+(?:,\d{2}))\s+
+        (?P<price>\d+(?:[.,]\d{2}))\s+
+        (?P<total>\d+(?:[.,]\d{2}))\s+
         (?P<vat>\d+)
         $
         """,
@@ -419,7 +419,7 @@ def parse_omnia_new(lines: list[str]):
         "Truck. No.:",
         "Shipping Starting Date",
         "Driver signature:",
-        "Addresse signature:",
+        "Addressee signature:",
         "SWIFT - Bank transfer",
         "No. ",
         "Via Travnik",
@@ -451,6 +451,7 @@ def parse_omnia_new(lines: list[str]):
 
     for raw in lines:
         line = normalize_text(str(raw))
+
         if not line:
             continue
 
@@ -464,20 +465,28 @@ def parse_omnia_new(lines: list[str]):
     while i < len(cleaned):
         line = cleaned[i]
 
-        # dopravu vůbec neexportovat
+        # Dopravu vůbec neexportovat
         if line.startswith("TRASP.EU.VEN") or "Shipping Fees" in line:
             i += 1
             continue
 
-        # 1) běžný řádek
+        # 1) Běžná položka na jednom řádku
         m = full_row_re.match(line)
 
         if m:
+            code = m.group("code").strip()
+
+            if code == "TRASP.EU.VEN":
+                i += 1
+                continue
+
             items.append({
-                "Kód zboží dodavatele": m.group("code").strip(),
+                "Kód zboží dodavatele": code,
                 "Název": m.group("name").strip(),
                 "Množství": int(m.group("qty")),
-                "Cena celkem": float(m.group("total").replace(",", ".")),
+                "Cena celkem": float(
+                    m.group("total").replace(",", ".")
+                ),
                 "Zkrácená poznámka": "",
                 "Kód kombinované nomenklatury": "",
                 "Země původu": "",
@@ -487,7 +496,7 @@ def parse_omnia_new(lines: list[str]):
             i += 1
             continue
 
-        # 2) víceřádkový název
+        # 2) Položka s názvem rozděleným do více řádků
         start = re.match(
             r"^(?P<code>[A-Z0-9.\-]+)\s+(?P<name>.+)$",
             line,
@@ -507,6 +516,8 @@ def parse_omnia_new(lines: list[str]):
             while j < len(cleaned):
                 nxt = cleaned[j]
 
+                # Hledáme řádek obsahující:
+                # množství + Pcs + jednotkovou cenu + celkovou cenu + VAT
                 tail = tail_re.match(nxt)
 
                 if tail:
@@ -514,7 +525,9 @@ def parse_omnia_new(lines: list[str]):
                         "Kód zboží dodavatele": code,
                         "Název": " ".join(name_parts).strip(),
                         "Množství": int(tail.group("qty")),
-                        "Cena celkem": float(tail.group("total").replace(",", ".")),
+                        "Cena celkem": float(
+                            tail.group("total").replace(",", ".")
+                        ),
                         "Zkrácená poznámka": "",
                         "Kód kombinované nomenklatury": "",
                         "Země původu": "",
@@ -525,11 +538,28 @@ def parse_omnia_new(lines: list[str]):
                     found = True
                     break
 
-                # pokud narazíme na další kompletní položku, skončíme
+                # Pokud narazíme na dopravu, položku ukončíme
+                if nxt.startswith("TRASP.EU.VEN") or "Shipping Fees" in nxt:
+                    break
+
+                # Pokud narazíme na další kompletní položku,
+                # nepřipojujeme ji k názvu předchozí položky
                 if full_row_re.match(nxt):
                     break
 
-                name_parts.append(nxt)
+                # Konec tabulky / souhrny faktury
+                if nxt.startswith((
+                    "Übertrag",
+                    "Nettobetrag",
+                    "Mehrwertsteuer",
+                    "Bruttobetrag",
+                    "Zahlungsbedingungen",
+                    "Soweit nicht anders",
+                    "TOTAL DOCUMENT",
+                )):
+                    break
+
+                name_parts.append(nxt.strip())
                 j += 1
 
             if found:
