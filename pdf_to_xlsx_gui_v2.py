@@ -367,11 +367,11 @@ def parse_omnia(lines: list[str]):
     return items, warnings
 
 
-    # =========================
-    # OMNIA NEW PARSER
-    # =========================
-    
-    def parse_omnia_new(lines: list[str]):
+# =========================
+# OMNIA NEW PARSER
+# =========================
+   
+def parse_omnia_new(lines: list[str]):
         items = []
         warnings = []
 
