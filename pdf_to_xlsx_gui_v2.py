@@ -1020,7 +1020,7 @@ class App(tk.Tk):
             return
         messagebox.showinfo("Detekce", f"Rozpoznaný typ PDF: {supplier}")
 
-        def _parse(self):
+    def _parse(self):
         lines, supplier = self._load_and_detect()
 
         if supplier == "ASWO":
