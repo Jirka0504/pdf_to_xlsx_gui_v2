@@ -4,8 +4,6 @@ from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
 
 import pdfplumber
-import pytesseract
-from PIL import Image
 
 from openpyxl import Workbook
 from openpyxl.styles import Font
