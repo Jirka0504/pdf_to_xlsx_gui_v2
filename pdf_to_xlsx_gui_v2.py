@@ -4,6 +4,9 @@ from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
 
 import pdfplumber
+import pytesseract
+from PIL import Image
+
 from openpyxl import Workbook
 from openpyxl.styles import Font
 
@@ -46,13 +49,35 @@ def float_to_dot_string(value: float) -> str:
 
 def extract_pdf_lines(pdf_path: str):
     lines = []
+
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
             text = page.extract_text() or ""
+
             for raw_line in text.splitlines():
                 line = normalize_text(raw_line)
                 if line:
                     lines.append(line)
+
+        # Běžná PDF s textovou vrstvou - stejné chování jako dosud
+        if lines:
+            return lines
+
+        # OCR fallback pouze pro naskenované PDF
+        for page in pdf.pages:
+            page_image = page.to_image(resolution=300).original
+
+            text = pytesseract.image_to_string(
+                page_image,
+                lang="ces+eng",
+                config="--psm 6"
+            )
+
+            for raw_line in text.splitlines():
+                line = normalize_text(raw_line)
+                if line:
+                    lines.append(line)
+
     return lines
 
 
@@ -80,6 +105,9 @@ def detect_supplier(lines: list[str]) -> str:
 
     if ("phono-zubehör-vertrieb gmbh" in text or "analogis" in text and "art.nr." in text and "gesamtpreis" in text):
         return "ANALOGIS"
+
+    if ("eta a. s." in text or "daňový doklad - faktura" in text and "artikl" in text and "cena/mj" in text ):
+        return "ETA"
 
     return "UNKNOWN"
 
@@ -925,6 +953,68 @@ def parse_analogis(lines: list[str]):
 
     return items, warnings
 
+# =========================
+# ETA PARSER
+# =========================
+
+def parse_eta(lines: list[str]):
+    items = []
+    warnings = []
+
+    row_re = re.compile(
+        r"""
+        ^
+        (?P<code>ETA\d+)\s+
+        (?P<cp>\d+)\s+
+        (?P<name>.+?)\s+
+        (?P<qty>\d+)\s+
+        KS\s+
+        (?P<vat>\d+)%\s+
+        (?P<unit_price>\d+(?:,\d{2}))\s+
+        (?P<rp>\d+(?:,\d{2}))\s+
+        (?P<total>\d+(?:\.\d{3})*,\d{2})\s+
+        (?P<vat_total>\d+(?:\.\d{3})*,\d{2})
+        $
+        """,
+        re.VERBOSE | re.IGNORECASE,
+    )
+
+    for raw in lines:
+        line = normalize_text(str(raw))
+        if not line:
+            continue
+
+        m = row_re.match(line)
+        if not m:
+            continue
+
+        code = m.group("code").strip()
+
+        # odstranit počáteční ETA
+        if code.upper().startswith("ETA"):
+            code = code[3:]
+
+        qty = int(m.group("qty"))
+
+        total = float(
+            m.group("total")
+            .replace(".", "")
+            .replace(",", ".")
+        )
+
+        items.append({
+            "Kód zboží dodavatele": code,
+            "Název": m.group("name").strip(),
+            "Množství": qty,
+            "Cena celkem": total,
+            "Zkrácená poznámka": "",
+            "Kód kombinované nomenklatury": "",
+            "Země původu": "",
+            "Hmotnost": "",
+        })
+
+    return items, warnings
+
     
 # =========================
 # SAVE XLSX
@@ -1070,6 +1160,9 @@ class App(tk.Tk):
 
         if supplier == "ANALOGIS":
             return parse_analogis(lines), supplier
+
+        if supplier == "ETA":
+            return parse_eta(lines), supplier
 
         raise ValueError("Nepodařilo se rozpoznat typ PDF. Tento dokument zatím není podporovaný.")
         
