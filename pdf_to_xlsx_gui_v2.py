@@ -56,30 +56,11 @@ def extract_pdf_lines(pdf_path: str):
 
             for raw_line in text.splitlines():
                 line = normalize_text(raw_line)
-                if line:
-                    lines.append(line)
 
-        # Běžná PDF s textovou vrstvou - stejné chování jako dosud
-        if lines:
-            return lines
-
-        # OCR fallback pouze pro naskenované PDF
-        for page in pdf.pages:
-            page_image = page.to_image(resolution=300).original
-
-            text = pytesseract.image_to_string(
-                page_image,
-                lang="ces+eng",
-                config="--psm 6"
-            )
-
-            for raw_line in text.splitlines():
-                line = normalize_text(raw_line)
                 if line:
                     lines.append(line)
 
     return lines
-
 
 def detect_supplier(lines: list[str]) -> str:
     text = "\n".join(lines).lower()
@@ -106,7 +87,7 @@ def detect_supplier(lines: list[str]) -> str:
     if ("phono-zubehör-vertrieb gmbh" in text or "analogis" in text and "art.nr." in text and "gesamtpreis" in text):
         return "ANALOGIS"
 
-    if ("eta a. s." in text or "daňový doklad - faktura" in text and "artikl" in text and "cena/mj" in text ):
+    if ("eta a. s." in text and "artikl" in text and ("popis artiklu" in text or "název" in text)):
         return "ETA"
 
     return "UNKNOWN"
@@ -961,60 +942,212 @@ def parse_eta(lines: list[str]):
     items = []
     warnings = []
 
+    price_pattern = r"\d{1,3}(?:\.\d{3})*,\d{2}|\d+,\d{2}"
+
     row_re = re.compile(
-        r"""
+        rf"""
         ^
-        (?P<code>ETA\d+)\s+
-        (?P<cp>\d+)\s+
+        (?P<code>ETA\d+|\#\d+)\s+
         (?P<name>.+?)\s+
         (?P<qty>\d+)\s+
-        KS\s+
-        (?P<vat>\d+)%\s+
-        (?P<unit_price>\d+(?:,\d{2}))\s+
-        (?P<rp>\d+(?:,\d{2}))\s+
-        (?P<total>\d+(?:\.\d{3})*,\d{2})\s+
-        (?P<vat_total>\d+(?:\.\d{3})*,\d{2})
+        (?P<vat>\d+)\s+
+        (?P<unit_price>{price_pattern})\s+
+        (?P<unit_price_rp>{price_pattern})\s+
+        (?P<total>{price_pattern})\s+
+        (?P<vat_total>{price_pattern})
         $
         """,
         re.VERBOSE | re.IGNORECASE,
     )
 
-    for raw in lines:
-        line = normalize_text(str(raw))
-        if not line:
-            continue
+    tail_re = re.compile(
+        rf"""
+        ^
+        (?P<qty>\d+)\s+
+        (?P<vat>\d+)\s+
+        (?P<unit_price>{price_pattern})\s+
+        (?P<unit_price_rp>{price_pattern})\s+
+        (?P<total>{price_pattern})\s+
+        (?P<vat_total>{price_pattern})
+        $
+        """,
+        re.VERBOSE,
+    )
 
-        m = row_re.match(line)
-        if not m:
-            continue
+    item_start_re = re.compile(
+        r"^(?P<code>ETA\d+|\#\d+)\s+(?P<name>.+)$",
+        re.IGNORECASE,
+    )
 
-        code = m.group("code").strip()
+    skip_prefixes = (
+        "Číslo zakázky:",
+        "Externí číslo obj.:",
+        "Dodavatel:",
+        "Zákazník:",
+        "ETA a. s.",
+        "Křižíkova",
+        "18600 Praha",
+        "IČO:",
+        "Tel.:",
+        "Email:",
+        "KTS - AME",
+        "Karla Čapka",
+        "50002 Hradec",
+        "Datum vystavení:",
+        "Datum odeslání:",
+        "Způsob dopravy:",
+        "Forma úhrady:",
+        "Dodací adresa:",
+        "Kosice",
+        "503 51",
+        "Artikl Popis artiklu",
+        "Artikl",
+        "Sazba % DPH",
+        "Celkem bez RP:",
+        "Celkem s RP:",
+        "Celkem k úhradě:",
+        "Celkové množství",
+        "Celková hmotnost",
+        "Celkový objem",
+        "Kalkulace ceny",
+    )
 
-        # odstranit počáteční ETA
+    def eta_price_to_float(value: str) -> float:
+        value = str(value).strip()
+        value = value.replace("\xa0", "")
+        value = value.replace(" ", "")
+        value = value.replace(".", "")
+        value = value.replace(",", ".")
+        return float(value)
+
+    def eta_clean_code(code: str) -> str:
+        code = str(code).strip()
+
         if code.upper().startswith("ETA"):
             code = code[3:]
 
-        qty = int(m.group("qty"))
+        if code.startswith("#"):
+            code = code[1:]
 
-        total = float(
-            m.group("total")
-            .replace(".", "")
-            .replace(",", ".")
-        )
+        return code.strip()
 
-        items.append({
-            "Kód zboží dodavatele": code,
-            "Název": m.group("name").strip(),
-            "Množství": qty,
-            "Cena celkem": total,
-            "Zkrácená poznámka": "",
-            "Kód kombinované nomenklatury": "",
-            "Země původu": "",
-            "Hmotnost": "",
-        })
+    cleaned = []
+
+    for raw in lines:
+        line = normalize_text(str(raw))
+
+        if not line:
+            continue
+
+        if any(line.startswith(prefix) for prefix in skip_prefixes):
+            continue
+
+        if re.fullmatch(r"\d+\s*/\s*\d+", line):
+            continue
+
+        cleaned.append(line)
+
+    i = 0
+
+    while i < len(cleaned):
+        line = cleaned[i]
+
+        m = row_re.match(line)
+
+        if m:
+            items.append({
+                "Kód zboží dodavatele": eta_clean_code(m.group("code")),
+                "Název": m.group("name").strip(),
+                "Množství": int(m.group("qty")),
+                "Cena celkem": eta_price_to_float(m.group("total")),
+                "Zkrácená poznámka": "",
+                "Kód kombinované nomenklatury": "",
+                "Země původu": "",
+                "Hmotnost": "",
+            })
+
+            i += 1
+            continue
+
+        start = item_start_re.match(line)
+
+        if start:
+            original_code = start.group("code").strip()
+            name_parts = [start.group("name").strip()]
+
+            j = i + 1
+            found = False
+
+            while j < len(cleaned):
+                nxt = cleaned[j]
+
+                tail = tail_re.match(nxt)
+
+                if tail:
+                    items.append({
+                        "Kód zboží dodavatele": eta_clean_code(original_code),
+                        "Název": " ".join(name_parts).strip(),
+                        "Množství": int(tail.group("qty")),
+                        "Cena celkem": eta_price_to_float(tail.group("total")),
+                        "Zkrácená poznámka": "",
+                        "Kód kombinované nomenklatury": "",
+                        "Země původu": "",
+                        "Hmotnost": "",
+                    })
+
+                    i = j + 1
+                    found = True
+                    break
+
+                combined_name = " ".join(name_parts + [nxt]).strip()
+                fake_line = f"{original_code} {combined_name}"
+
+                m2 = row_re.match(fake_line)
+
+                if m2:
+                    items.append({
+                        "Kód zboží dodavatele": eta_clean_code(m2.group("code")),
+                        "Název": m2.group("name").strip(),
+                        "Množství": int(m2.group("qty")),
+                        "Cena celkem": eta_price_to_float(m2.group("total")),
+                        "Zkrácená poznámka": "",
+                        "Kód kombinované nomenklatury": "",
+                        "Země původu": "",
+                        "Hmotnost": "",
+                    })
+
+                    i = j + 1
+                    found = True
+                    break
+
+                if item_start_re.match(nxt):
+                    break
+
+                if nxt.startswith((
+                    "Sazba % DPH",
+                    "Celkem bez RP:",
+                    "Celkem s RP:",
+                    "Celkem k úhradě:",
+                    "Celkové množství",
+                    "Celková hmotnost",
+                    "Celkový objem",
+                    "Kalkulace ceny",
+                )):
+                    break
+
+                name_parts.append(nxt.strip())
+                j += 1
+
+            if found:
+                continue
+
+            warnings.append(
+                f"ETA: nepodařilo se naparsovat položku: {line}"
+            )
+
+        i += 1
 
     return items, warnings
-
     
 # =========================
 # SAVE XLSX
