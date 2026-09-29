@@ -410,6 +410,27 @@ def parse_omnia_new(lines: list[str]):
         re.VERBOSE | re.IGNORECASE,
     )
 
+    # řádek: KÓD + množství + Pcs + cena + total + VAT
+    code_tail_re = re.compile(
+        r"""
+        ^
+        (?P<code>[A-Z0-9.\-]+)\s+
+        (?P<qty>\d+)\s+
+        Pcs\s+
+        (?P<price>\d+(?:[.,]\d{2}))\s+
+        (?P<total>\d+(?:[.,]\d{2}))\s+
+        (?P<vat>\d+)
+        $
+        """,
+        re.VERBOSE | re.IGNORECASE,
+    )
+
+    # samotný kód
+    code_only_re = re.compile(
+        r"^[A-Z0-9][A-Z0-9.\-]*$",
+        re.IGNORECASE,
+    )
+
     skip_prefixes = (
         "Code Cust. Item",
         "Shipment No.",
@@ -454,6 +475,16 @@ def parse_omnia_new(lines: list[str]):
         "Fedex",
     )
 
+    stop_prefixes = (
+        "Übertrag",
+        "Nettobetrag",
+        "Mehrwertsteuer",
+        "Bruttobetrag",
+        "Zahlungsbedingungen",
+        "Soweit nicht anders",
+        "TOTAL DOCUMENT",
+    )
+
     cleaned = []
 
     for raw in lines:
@@ -467,46 +498,154 @@ def parse_omnia_new(lines: list[str]):
 
         cleaned.append(line)
 
+    def is_shipping(line):
+        return (
+            line.startswith("TRASP.EU.VEN")
+            or "Shipping Fees" in line
+        )
+
+    def add_item(code, name, qty, total):
+        code = code.strip()
+        name = name.strip()
+
+        if code == "TRASP.EU.VEN":
+            return
+
+        items.append({
+            "Kód zboží dodavatele": code,
+            "Název": name,
+            "Množství": int(qty),
+            "Cena celkem": float(
+                str(total).replace(",", ".")
+            ),
+            "Zkrácená poznámka": "",
+            "Kód kombinované nomenklatury": "",
+            "Země původu": "",
+            "Hmotnost": "",
+        })
+
     i = 0
 
     while i < len(cleaned):
         line = cleaned[i]
 
-        # Dopravu vůbec neexportovat
-        if line.startswith("TRASP.EU.VEN") or "Shipping Fees" in line:
+        if is_shipping(line):
             i += 1
             continue
 
-        # 1) Běžná položka na jednom řádku
+        if line.startswith(stop_prefixes):
+            i += 1
+            continue
+
+        # ==========================================
+        # 1) standardní kompletní řádek
+        # KÓD NÁZEV QTY Pcs PRICE TOTAL VAT
+        # ==========================================
+
         m = full_row_re.match(line)
 
         if m:
-            code = m.group("code").strip()
+            add_item(
+                m.group("code"),
+                m.group("name"),
+                m.group("qty"),
+                m.group("total"),
+            )
+
+            i += 1
+            continue
+
+        # ==========================================
+        # 2) NÁZEV je na řádku PŘED kódem
+        #
+        # například:
+        # Heating element ...
+        # HTR030ZN 2 Pcs 3.20 6.40 22
+        # ==========================================
+
+        if i + 1 < len(cleaned):
+            nxt = cleaned[i + 1]
+            ct = code_tail_re.match(nxt)
+
+            if ct:
+                if not code_only_re.match(line):
+                    add_item(
+                        ct.group("code"),
+                        line,
+                        ct.group("qty"),
+                        ct.group("total"),
+                    )
+
+                    i += 2
+                    continue
+
+        # ==========================================
+        # 3) samotný KÓD
+        #
+        # KÓD
+        # název
+        # další část názvu
+        # QTY Pcs PRICE TOTAL VAT
+        # ==========================================
+
+        if code_only_re.match(line):
+            code = line.strip()
 
             if code == "TRASP.EU.VEN":
                 i += 1
                 continue
 
-            items.append({
-                "Kód zboží dodavatele": code,
-                "Název": m.group("name").strip(),
-                "Množství": int(m.group("qty")),
-                "Cena celkem": float(
-                    m.group("total").replace(",", ".")
-                ),
-                "Zkrácená poznámka": "",
-                "Kód kombinované nomenklatury": "",
-                "Země původu": "",
-                "Hmotnost": "",
-            })
+            name_parts = []
+            j = i + 1
+            found = False
 
-            i += 1
-            continue
+            while j < len(cleaned):
+                nxt = cleaned[j]
 
-        # 2) Položka s názvem rozděleným do více řádků
+                if is_shipping(nxt):
+                    break
+
+                if nxt.startswith(stop_prefixes):
+                    break
+
+                tail = tail_re.match(nxt)
+
+                if tail:
+                    add_item(
+                        code,
+                        " ".join(name_parts),
+                        tail.group("qty"),
+                        tail.group("total"),
+                    )
+
+                    i = j + 1
+                    found = True
+                    break
+
+                if full_row_re.match(nxt):
+                    break
+
+                if code_tail_re.match(nxt):
+                    break
+
+                name_parts.append(nxt.strip())
+                j += 1
+
+            if found:
+                continue
+
+        # ==========================================
+        # 4) KÓD + začátek názvu
+        #
+        # KÓD část názvu
+        # pokračování názvu
+        # QTY Pcs PRICE TOTAL VAT
+        # ==========================================
+
         start = re.match(
             r"^(?P<code>[A-Z0-9.\-]+)\s+(?P<name>.+)$",
             line,
+            re.IGNORECASE,
         )
 
         if start:
@@ -523,53 +662,89 @@ def parse_omnia_new(lines: list[str]):
             while j < len(cleaned):
                 nxt = cleaned[j]
 
-                # Hledáme řádek obsahující:
-                # množství + Pcs + jednotkovou cenu + celkovou cenu + VAT
+                if is_shipping(nxt):
+                    break
+
+                if nxt.startswith(stop_prefixes):
+                    break
+
                 tail = tail_re.match(nxt)
 
                 if tail:
-                    items.append({
-                        "Kód zboží dodavatele": code,
-                        "Název": " ".join(name_parts).strip(),
-                        "Množství": int(tail.group("qty")),
-                        "Cena celkem": float(
-                            tail.group("total").replace(",", ".")
-                        ),
-                        "Zkrácená poznámka": "",
-                        "Kód kombinované nomenklatury": "",
-                        "Země původu": "",
-                        "Hmotnost": "",
-                    })
+                    add_item(
+                        code,
+                        " ".join(name_parts),
+                        tail.group("qty"),
+                        tail.group("total"),
+                    )
 
                     i = j + 1
                     found = True
                     break
 
-                # Pokud narazíme na dopravu, položku ukončíme
-                if nxt.startswith("TRASP.EU.VEN") or "Shipping Fees" in nxt:
-                    break
-
-                # Pokud narazíme na další kompletní položku,
-                # nepřipojujeme ji k názvu předchozí položky
                 if full_row_re.match(nxt):
                     break
 
-                # Konec tabulky / souhrny faktury
-                if nxt.startswith((
-                    "Übertrag",
-                    "Nettobetrag",
-                    "Mehrwertsteuer",
-                    "Bruttobetrag",
-                    "Zahlungsbedingungen",
-                    "Soweit nicht anders",
-                    "TOTAL DOCUMENT",
-                )):
+                if code_tail_re.match(nxt):
                     break
 
                 name_parts.append(nxt.strip())
                 j += 1
 
             if found:
+                continue
+
+        # ==========================================
+        # 5) název PŘED kódem
+        #
+        # název
+        # další část názvu
+        # KÓD
+        # QTY Pcs PRICE TOTAL VAT
+        # ==========================================
+
+        if not code_only_re.match(line):
+            name_parts = [line.strip()]
+            j = i + 1
+
+            while j < len(cleaned):
+                nxt = cleaned[j]
+
+                if is_shipping(nxt):
+                    break
+
+                if nxt.startswith(stop_prefixes):
+                    break
+
+                if code_only_re.match(nxt):
+                    code = nxt.strip()
+
+                    if j + 1 < len(cleaned):
+                        tail = tail_re.match(cleaned[j + 1])
+
+                        if tail:
+                            add_item(
+                                code,
+                                " ".join(name_parts),
+                                tail.group("qty"),
+                                tail.group("total"),
+                            )
+
+                            i = j + 2
+                            break
+
+                    break
+
+                if full_row_re.match(nxt):
+                    break
+
+                if code_tail_re.match(nxt):
+                    break
+
+                name_parts.append(nxt.strip())
+                j += 1
+
+            if i >= j + 1:
                 continue
 
         i += 1
